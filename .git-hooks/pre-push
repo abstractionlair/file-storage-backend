@@ -1,0 +1,138 @@
+#!/bin/bash
+# Pre-push hook: Automatic Codex review before pushing
+# 
+# This hook runs before git push and requests a Codex review of changes.
+# To skip review for trivial changes: git push --no-verify
+#
+# Installation: 
+#   cp .git-hooks/pre-push .git/hooks/pre-push
+#   chmod +x .git/hooks/pre-push
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo "${YELLOW}🔍 Running pre-push Codex review...${NC}"
+
+# Get the remote and branch being pushed to
+remote="$1"
+url="$2"
+
+# Get current branch
+current_branch=$(git symbolic-ref --short HEAD)
+
+# Get the tracking branch (what we're comparing against)
+tracking_branch=$(git for-each-ref --format='%(upstream:short)' "refs/heads/$current_branch")
+
+# If no tracking branch, compare with origin/main
+if [ -z "$tracking_branch" ]; then
+    tracking_branch="origin/main"
+fi
+
+# Check if there are any changes to review
+if ! git diff --quiet "$tracking_branch...HEAD" 2>/dev/null; then
+    # Get the diff
+    diff_output=$(git diff "$tracking_branch...HEAD")
+    
+    # Get list of changed files
+    changed_files=$(git diff --name-only "$tracking_branch...HEAD")
+    
+    # Check if AGENTS.md exists in repo
+    if [ -f "AGENTS.md" ]; then
+        agent_file_arg="--agent-file AGENTS.md"
+    else
+        agent_file_arg=""
+    fi
+    
+    # Create review request
+    review_request=$(cat <<EOF
+# PRE-PUSH CODE REVIEW
+
+## Branch: $current_branch → $tracking_branch
+## Files Changed:
+$changed_files
+
+## Diff:
+\`\`\`diff
+$diff_output
+\`\`\`
+
+## Review Request:
+This is a pre-push review. Please check for:
+- Obvious bugs or issues
+- Security vulnerabilities
+- Contract violations (if contracts exist)
+- Major code quality problems
+
+This is NOT a final review - just a safety check before push.
+Quick review is fine.
+EOF
+)
+    
+    # Save review request to temp file
+    review_file=$(mktemp)
+    echo "$review_request" > "$review_file"
+    
+    # Call codex for review
+    echo "${YELLOW}Requesting Codex review...${NC}"
+    
+    # Check if codex command exists
+    if ! command -v codex &> /dev/null; then
+        echo "${RED}Error: 'codex' command not found.${NC}"
+        echo "${YELLOW}Skipping review. To require review, install codex CLI.${NC}"
+        rm "$review_file"
+        exit 0
+    fi
+    
+    # Run review (with timeout)
+    if timeout 60s codex exec $agent_file_arg -m gpt-5-codex < "$review_file" > "${review_file}.response" 2>&1; then
+        echo "${GREEN}✅ Codex review complete${NC}"
+        echo ""
+        echo "Review response:"
+        echo "----------------------------------------"
+        cat "${review_file}.response"
+        echo "----------------------------------------"
+        echo ""
+        
+        # Check for critical issues in response
+        if grep -qi "critical\|blocking\|must fix" "${review_file}.response"; then
+            echo "${RED}⚠️  Codex found critical issues!${NC}"
+            echo ""
+            read -p "Continue with push anyway? (yes/no): " confirm
+            if [ "$confirm" != "yes" ]; then
+                echo "${RED}Push cancelled. Fix issues and try again.${NC}"
+                rm "$review_file" "${review_file}.response"
+                exit 1
+            fi
+        fi
+        
+        # Save review to reviews/pre-push/ if directory exists
+        if [ -d "reviews/pre-push" ]; then
+            review_archive="reviews/pre-push/$(date +%Y%m%d_%H%M%S)_${current_branch}.md"
+            echo "Saving review to $review_archive"
+            cat "$review_file" > "$review_archive"
+            echo "" >> "$review_archive"
+            echo "---" >> "$review_archive"
+            echo "" >> "$review_archive"
+            cat "${review_file}.response" >> "$review_archive"
+        fi
+        
+        rm "$review_file" "${review_file}.response"
+    else
+        echo "${YELLOW}⚠️  Codex review timed out or failed${NC}"
+        echo "${YELLOW}Allowing push to continue...${NC}"
+        rm "$review_file"
+        if [ -f "${review_file}.response" ]; then
+            rm "${review_file}.response"
+        fi
+    fi
+else
+    echo "${GREEN}No changes to review${NC}"
+fi
+
+echo "${GREEN}✅ Pre-push checks complete${NC}"
+exit 0
