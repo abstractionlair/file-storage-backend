@@ -50,3 +50,6 @@ artifacts/
 # Environment
 .env
 .env.local
+
+# Reviews (local only, not committed)
+reviews/
